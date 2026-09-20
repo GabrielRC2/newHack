@@ -7,7 +7,6 @@ Backend FastAPI para uma única câmera USB na porta. Não usa direção, tracki
 Python 3.10 ou superior é necessário.
 
 ```powershell
-cd C:\Users\Gabriel\Documents\Codex\2026-09-20\obs-nessa-resposta-voc-deve-finalizar\outputs\frequency_mvp
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
@@ -20,7 +19,7 @@ Abra `http://127.0.0.1:8000/docs` para a documentação interativa. Em outro ter
 streamlit run streamlit_app.py
 ```
 
-O SQLite é criado como `frequency.db`. Para configurar a instalação, copie `.env.example` e defina as variáveis de ambiente no terminal. A troca futura para PostgreSQL depende só de `DATABASE_URL` e de instalar o driver `psycopg`.
+O SQLite é criado como `frequency.db`. Para configurar a instalação, copie `.env.example` e defina as variáveis de ambiente no terminal.
 
 ## Horários oficiais
 
@@ -75,15 +74,8 @@ No exemplo 15:00–15:10 e 16:00–16:30, o total é **40 minutos**. Conforme a 
 - `GET /sessions/{class_id}/students/{student_id}/attendance` — resumo individual
 - `POST /sessions/{class_id}/finalize` — fecha e calcula presença
 
-## Testes
 
-```powershell
-pytest -q
-```
-
-Os testes cobrem entrada/saída, soma de idas ao banheiro e retorno, debounce, rosto não cadastrado, aula encerrada, recorte do período oficial e regra de 75%.
-
-## Câmera USB e reconhecimento facial
+## Reconhecimento facial
 
 O backend não recebe imagens: o cliente local em `vision_client/` detecta o rosto, gera um embedding com YuNet + SFace do OpenCV e envia somente o vetor numérico para `POST /recognitions`. OpenCV possui suporte publicado para Python 3.14, e as APIs `FaceDetectorYN`/`FaceRecognizerSF` usadas pelo cliente são as recomendadas na documentação oficial do OpenCV. [OpenCV PyPI](https://pypi.org/project/opencv-python/) e [tutorial do modelo](https://docs.opencv.org/5.0/tutorials/dnn/dnn_face/dnn_face.html).
 
