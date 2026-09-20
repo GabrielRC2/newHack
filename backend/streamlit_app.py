@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import html
 import os
+import threading
+import time as clock
 from datetime import date, datetime, time, timedelta, timezone
 
 import cv2 as cv
@@ -18,6 +20,13 @@ import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
+
+try:  # camera continua no navegador: pip install streamlit-webrtc
+    import av
+    from streamlit_webrtc import VideoProcessorBase, webrtc_streamer
+    WEBRTC_AVAILABLE = True
+except ImportError:
+    WEBRTC_AVAILABLE = False
 
 from vision_client.api import FrequencyApi
 from vision_client.face_engine import FaceEngine, draw_face
@@ -412,6 +421,36 @@ def tab_dashboard(class_id: int | None, sessions: list[dict] | None) -> None:
 
 # --------------------------------------------------------------------------- aba: reconhecer
 
+def describe_recognition(api: FrequencyApi, response: dict, class_id: int, threshold: float | None) -> tuple[str, str, str]:
+    """Transforma a resposta de /recognitions em (tipo, titulo, detalhe) para o result_card.
+
+    Nao usa st.session_state, entao pode rodar tanto na tela quanto na thread de video.
+    """
+    score = response.get("match_score")
+    score_text = ""
+    if score is not None:
+        score_text = f"Similaridade {score:.2f}" + (f" (mínimo {threshold:.2f})" if threshold is not None else "")
+    status = response["status"]
+    if status == "identified":
+        info = None
+        try:
+            reply = api.session.get(
+                f"{api.base_url}/sessions/{class_id}/students/{response['student_id']}/attendance", timeout=8)
+            info = reply.json() if reply.ok else None
+        except (requests.RequestException, ValueError):
+            pass
+        name = info["student_name"] if info else f"Aluno #{response['student_id']}"
+        minutes = f", {info['total_minutes']:.1f} min em aula" if info else ""
+        return ("success", f"{name}: {ACTIONS.get(response['action'], response['action'])}", f"{score_text}{minutes}")
+    if status == "cooldown":
+        return ("info", "Aguarde alguns segundos", f"{response['message']}. {score_text}")
+    if status == "unregistered":
+        return ("warning", "Rosto não cadastrado", f"Nenhuma presença foi criada. {score_text}")
+    if status == "class_closed":
+        return ("error", "Aula já encerrada", "Selecione outra aula na barra lateral.")
+    return ("warning", response["message"], score_text)
+
+
 def handle_recognition(photo, class_id: int) -> None:
     frame, faces, preview = analyse_photo(photo)
     st.session_state.rec_preview = preview
@@ -427,31 +466,148 @@ def handle_recognition(photo, class_id: int) -> None:
         except Exception as exc:  # a API pode cair; a tela continua funcionando
             result = ("error", "Não foi possível enviar", str(exc))
         else:
-            score = response.get("match_score")
-            threshold = match_threshold()
-            score_text = ""
-            if score is not None:
-                score_text = f"Similaridade {score:.2f}" + (f" (mínimo {threshold:.2f})" if threshold is not None else "")
-            status = response["status"]
-            if status == "identified":
-                info, _ = request("GET", f"/sessions/{class_id}/students/{response['student_id']}/attendance")
-                name = info["student_name"] if info else f"Aluno #{response['student_id']}"
-                minutes = f", {info['total_minutes']:.1f} min em aula" if info else ""
-                result = ("success", f"{name}: {ACTIONS.get(response['action'], response['action'])}", f"{score_text}{minutes}")
-            elif status == "cooldown":
-                result = ("info", "Aguarde alguns segundos", f"{response['message']}. {score_text}")
-            elif status == "unregistered":
-                result = ("warning", "Rosto não cadastrado", f"Nenhuma presença foi criada. {score_text}")
-            elif status == "class_closed":
-                result = ("error", "Aula já encerrada", "Selecione outra aula na barra lateral.")
-            else:
-                result = ("warning", response["message"], score_text)
+            result = describe_recognition(api_client(), response, class_id, match_threshold())
 
     kind, title, detail = result
     st.session_state.rec_result = result
     st.session_state.rec_log = ([{"Hora": datetime.now().strftime("%H:%M:%S"), "Resultado": title}] + st.session_state.rec_log)[:10]
     st.session_state.rec_n += 1  # troca a chave do widget para liberar a camera para a proxima pessoa
     st.rerun()
+
+
+MIN_FACE_WIDTH = 80      # px: rosto mais estreito que isso esta longe demais para um embedding confiavel
+STABLE_FRAMES = 3        # frames seguidos com um unico rosto antes de disparar (evita rosto borrado de quem acabou de entrar)
+ABSENCE_SECONDS = 1.0    # tempo sem rosto que rearma uma nova passagem
+
+
+class RecognitionProcessor(VideoProcessorBase if WEBRTC_AVAILABLE else object):
+    """Processa cada frame da camera do navegador e envia uma deteccao por passagem.
+
+    Roda numa thread propria do streamlit-webrtc, entao NAO pode usar st.session_state.
+    A tela conversa com ele por set_config() e snapshot(), ambos protegidos por lock.
+    Nenhuma imagem e gravada: so o embedding vai para a API.
+    """
+
+    IDLE = ("idle", "Aguardando um aluno", "Fique de frente para a câmera. O registro é automático.")
+
+    def __init__(self) -> None:
+        # Instancia propria: o detector guarda estado (tamanho de entrada) e nao deve ser compartilhado entre threads.
+        self.engine = FaceEngine(DEFAULT_DETECTOR, DEFAULT_RECOGNIZER)
+        self._lock = threading.Lock()
+        self._config: dict = {}
+        self._result: tuple[str, str, str] = self.IDLE
+        self._log: list[dict] = []
+        self._armed = True
+        self._sending = False
+        self._stable = 0
+        self._last_face_at = 0.0
+
+    def set_config(self, **config) -> None:
+        with self._lock:
+            self._config = config
+
+    def snapshot(self) -> tuple[tuple[str, str, str], list[dict]]:
+        with self._lock:
+            return self._result, list(self._log)
+
+    def _publish(self, result: tuple[str, str, str]) -> None:
+        with self._lock:
+            self._result = result
+            self._log = ([{"Hora": datetime.now().strftime("%H:%M:%S"), "Resultado": result[1]}] + self._log)[:10]
+
+    def _send(self, embedding: list[float], config: dict) -> None:
+        # Em thread separada para o video nao travar enquanto a API responde.
+        try:
+            api = FrequencyApi(config["api_url"], config["token"])
+            response = api.send_recognition(config["class_id"], config["camera_id"], embedding, datetime.now())
+            result = describe_recognition(api, response, config["class_id"], config["threshold"])
+        except Exception as exc:  # a API pode cair; a camera continua rodando
+            result = ("error", "Não foi possível enviar", str(exc))
+        self._publish(result)
+        self._sending = False
+
+    def recv(self, frame):
+        image = frame.to_ndarray(format="bgr24")
+        now = clock.monotonic()
+        with self._lock:
+            config = dict(self._config)
+        faces = self.engine.detect(image)
+        banner, color = "Aguardando uma pessoa", (255, 255, 255)  # ASCII: fontes do OpenCV nao desenham acentos
+
+        if len(faces) == 0:
+            self._stable = 0
+            if now - self._last_face_at >= ABSENCE_SECONDS:
+                self._armed = True
+        elif len(faces) > 1:
+            self._last_face_at = now
+            self._stable = 0
+            banner, color = "Mais de um rosto: um aluno por vez", (0, 165, 255)
+            for face in faces:
+                draw_face(image, face, color)
+        else:
+            self._last_face_at = now
+            face = faces[0]
+            if face[2] < MIN_FACE_WIDTH:
+                self._stable = 0
+                banner, color = "Aproxime-se da camera", (0, 165, 255)
+            else:
+                self._stable += 1
+                if self._armed:
+                    banner, color = "Rosto detectado", (0, 210, 0)
+                else:
+                    banner, color = "Registrado. Saia do quadro para nova passagem", (200, 200, 200)
+                ready = self._armed and self._stable >= STABLE_FRAMES and not self._sending
+                if ready and config.get("class_id") is not None:
+                    self._armed = False
+                    self._sending = True
+                    try:
+                        # O embedding sai do frame limpo, antes de desenhar qualquer coisa nele.
+                        embedding = self.engine.embedding(image, face)
+                    except Exception as exc:
+                        self._sending = False
+                        self._publish(("error", "Falha ao ler o rosto", str(exc)))
+                    else:
+                        threading.Thread(target=self._send, args=(embedding, config), daemon=True).start()
+            draw_face(image, face, color)
+
+        cv.rectangle(image, (0, 0), (image.shape[1], 34), (25, 25, 25), -1)
+        cv.putText(image, banner, (10, 24), cv.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        return av.VideoFrame.from_ndarray(image, format="bgr24")
+
+
+def live_recognition(class_id: int, left, right) -> None:
+    """Camera sempre ligada: o navegador manda o video e cada passagem vira um reconhecimento."""
+    with left:
+        ctx = webrtc_streamer(
+            key="live-recognition",
+            video_processor_factory=RecognitionProcessor,
+            media_stream_constraints={"video": True, "audio": False},
+            rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
+            async_processing=True,
+        )
+        if ctx.video_processor is not None:
+            # Reenviado a cada rerun: trocar de aula ou de API na barra lateral vale na hora, sem religar a camera.
+            ctx.video_processor.set_config(
+                class_id=class_id, camera_id=st.session_state.camera_id, api_url=st.session_state.api_url,
+                token=st.session_state.api_token or None, threshold=match_threshold(),
+            )
+        health = get_health(st.session_state.api_url) or {}
+        st.caption(f"Clique em START e deixe a câmera ligada. Cada passagem alterna entre entrada e saída; "
+                   f"o mesmo aluno só é registrado de novo após {health.get('cooldown_seconds', 15)} s.")
+
+    def panel() -> None:
+        processor = ctx.video_processor
+        if processor is None:
+            result_card("idle", "Câmera desligada", "Clique em START para ligar. Depois disso o registro é automático.")
+            return
+        result, log = processor.snapshot()
+        result_card(*result)
+        if log:
+            st.caption("Últimos registros")
+            st.dataframe(pd.DataFrame(log), hide_index=True)
+
+    with right:
+        st.fragment(run_every=1 if ctx.state.playing else None)(panel)()
 
 
 def tab_recognize(class_id: int | None, sessions: list[dict] | None) -> None:
@@ -464,30 +620,38 @@ def tab_recognize(class_id: int | None, sessions: list[dict] | None) -> None:
         st.caption("Rode `python -m vision_client.download_models` para baixar os modelos.")
         return
 
+    modes = ["Câmera contínua", "Foto"] if WEBRTC_AVAILABLE else ["Foto"]
+    mode = st.radio("Modo de reconhecimento", modes, horizontal=True, key="rec_mode")
+    if not WEBRTC_AVAILABLE:
+        st.info("Para reconhecer com a câmera sempre ligada, rode `pip install streamlit-webrtc` e reinicie o app.")
+
     left, right = st.columns([1.1, 1], gap="large")
-    with left:
-        photo = st.camera_input("Um aluno por vez, olhando para a câmera", key=f"rec_cam_{st.session_state.rec_n}")
-        if photo is not None:
-            handle_recognition(photo, class_id)
-        health = get_health(st.session_state.api_url) or {}
-        st.caption(f"Cada foto alterna entre entrada e saída. Espere {health.get('cooldown_seconds', 15)} s "
-                   "antes de fotografar o mesmo aluno de novo.")
+    if mode == "Câmera contínua":
+        live_recognition(class_id, left, right)
+    else:
+        with left:
+            photo = st.camera_input("Um aluno por vez, olhando para a câmera", key=f"rec_cam_{st.session_state.rec_n}")
+            if photo is not None:
+                handle_recognition(photo, class_id)
+            health = get_health(st.session_state.api_url) or {}
+            st.caption(f"Cada foto alterna entre entrada e saída. Espere {health.get('cooldown_seconds', 15)} s "
+                       "antes de fotografar o mesmo aluno de novo.")
 
-    with right:
-        result = st.session_state.rec_result
-        if result:
-            result_card(*result)
-            if st.session_state.rec_preview is not None:
-                st.image(st.session_state.rec_preview, caption="Última captura")
-        else:
-            result_card("idle", "Aguardando um aluno", "Tire a foto para registrar entrada ou saída.")
+        with right:
+            result = st.session_state.rec_result
+            if result:
+                result_card(*result)
+                if st.session_state.rec_preview is not None:
+                    st.image(st.session_state.rec_preview, caption="Última captura")
+            else:
+                result_card("idle", "Aguardando um aluno", "Tire a foto para registrar entrada ou saída.")
 
-        if st.session_state.rec_log:
-            st.caption("Últimos registros")
-            st.dataframe(pd.DataFrame(st.session_state.rec_log), hide_index=True)
+            if st.session_state.rec_log:
+                st.caption("Últimos registros")
+                st.dataframe(pd.DataFrame(st.session_state.rec_log), hide_index=True)
 
-    with st.expander("Prefere uma câmera contínua na porta da sala?"):
-        st.write("O modo contínuo detecta sozinho quem passa, sem precisar clicar. Rode no terminal:")
+    with st.expander("Prefere uma câmera USB na porta da sala, fora do navegador?"):
+        st.write("Esse modo abre uma janela do OpenCV e detecta sozinho quem passa. Rode no terminal:")
         st.code(
             f"python -m vision_client.run_camera --class-id {class_id} "
             f"--camera-id {st.session_state.camera_id} --api-url {st.session_state.api_url}",
@@ -565,6 +729,20 @@ def tab_enroll() -> None:
             "Nome": item["name"], "Matrícula": item["enrollment_number"],
             "Fotos": item["embeddings_count"], "Cadastrado em": fmt_utc_local(item["created_at"]),
         } for item in students]), hide_index=True)
+
+        with st.expander("Remover aluno"):
+            labels = {item["id"]: f"{item['name']} ({item['enrollment_number']})" for item in students}
+            picked = st.selectbox("Aluno", list(labels), format_func=labels.get, key="delete_student")
+            st.caption("Apaga o cadastro, as fotos (embeddings) e todo o histórico de presença e reconhecimentos "
+                       "desse aluno, inclusive em aulas já encerradas. Isso não pode ser desfeito.")
+            confirm_delete = st.checkbox("Entendo e quero apagar este aluno", key=f"delete_confirm_{picked}")
+            if st.button("Apagar aluno", type="primary", disabled=not confirm_delete):
+                data, error = request("DELETE", f"/students/{picked}")
+                if error:
+                    st.error(error)
+                else:
+                    flash(f"{data['name']} foi removido.")
+                    st.rerun()
 
 
 # --------------------------------------------------------------------------- aba: aulas

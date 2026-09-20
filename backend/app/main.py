@@ -4,7 +4,7 @@ from datetime import datetime, time
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, status
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from .database import Base, engine, get_db
@@ -75,6 +75,23 @@ def create_student(payload: StudentCreate, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(student)
     return student
+
+
+@app.delete("/students/{student_id}")
+def delete_student(student_id: int, db: Session = Depends(get_db)):
+    student = db.get(Student, student_id)
+    if not student:
+        raise HTTPException(status_code=404, detail="Aluno nao encontrado")
+    name = student.name
+    # Attendance, PresenceInterval e RecognitionEvent nao tem cascade no modelo:
+    # apagamos explicitamente para nao deixar registros orfaos (e para nao violar FKs em outros bancos).
+    db.execute(delete(PresenceInterval).where(PresenceInterval.student_id == student_id))
+    db.execute(delete(Attendance).where(Attendance.student_id == student_id))
+    db.execute(delete(RecognitionEvent).where(RecognitionEvent.student_id == student_id))
+    # Os FaceEmbedding saem junto por causa do cascade="all, delete-orphan" do relationship.
+    db.delete(student)
+    db.commit()
+    return {"id": student_id, "name": name, "message": "Aluno e todos os seus dados foram removidos"}
 
 
 @app.post("/students/{student_id}/embeddings", status_code=status.HTTP_201_CREATED)
