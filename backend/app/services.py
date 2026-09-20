@@ -11,7 +11,9 @@ from sqlalchemy.orm import Session
 from .models import Attendance, FaceEmbedding, PresenceInterval, RecognitionEvent, Student
 
 
-MATCH_THRESHOLD = float(os.getenv("FACE_MATCH_THRESHOLD", "0.82"))
+# O modelo SFace do OpenCV usa similaridade de cosseno; 0.45 e um ponto de partida
+# conservador. Este valor deve ser calibrado com dados autorizados da instituicao.
+MATCH_THRESHOLD = float(os.getenv("FACE_MATCH_THRESHOLD", "0.45"))
 COOLDOWN_SECONDS = int(os.getenv("RECOGNITION_COOLDOWN_SECONDS", "15"))
 
 

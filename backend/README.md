@@ -83,9 +83,37 @@ pytest -q
 
 Os testes cobrem entrada/saída, soma de idas ao banheiro e retorno, debounce, rosto não cadastrado, aula encerrada, recorte do período oficial e regra de 75%.
 
+## Câmera USB e reconhecimento facial
+
+O backend não recebe imagens: o cliente local em `vision_client/` detecta o rosto, gera um embedding com YuNet + SFace do OpenCV e envia somente o vetor numérico para `POST /recognitions`. OpenCV possui suporte publicado para Python 3.14, e as APIs `FaceDetectorYN`/`FaceRecognizerSF` usadas pelo cliente são as recomendadas na documentação oficial do OpenCV. [OpenCV PyPI](https://pypi.org/project/opencv-python/) e [tutorial do modelo](https://docs.opencv.org/5.0/tutorials/dnn/dnn_face/dnn_face.html).
+
+Com a API já iniciada, instale as dependências adicionais e baixe os dois modelos ONNX uma vez:
+
+```bash
+python -m pip install -r requirements.txt
+python -m vision_client.download_models
+```
+
+Cadastre o aluno usando o mesmo modelo da câmera. Na janela, mantenha apenas um rosto e pressione `C` três vezes, variando levemente a pose; `Q` cancela sem enviar dados.
+
+```bash
+python -m vision_client.enroll --name "Ana Silva" --enrollment-number "2026001"
+```
+
+Crie uma aula e anote o ID retornado. Em seguida, execute a câmera:
+
+```bash
+python -m vision_client.run_camera --class-id 1 --camera-id usb-entrada-01
+```
+
+O cliente envia **um evento por passagem** e só rearma após um segundo sem rosto no enquadramento. Isso impede que a pessoa parada diante da câmera gere uma falsa saída após o cooldown. Quando há mais de um rosto, ele não envia nada e pede que passe um aluno por vez. Altere `--camera-index 1` se a webcam USB não for o índice `0`.
+
+O valor inicial de `FACE_MATCH_THRESHOLD` foi ajustado para `0.45`, adequado para embeddings SFace normalizados como ponto de partida. Ele não é uma garantia: valide o limiar com dados consentidos da instituição antes de operação real.
+
 ## Limites, privacidade e segurança
 
 - Câmera única não permite saber a direção física: por contrato, o estado atual é a fonte da entrada/saída. Uma “saída sem entrada” não pode ser distinguida de uma entrada, portanto inicia um intervalo e fica registrada como `entered`.
 - Obtenha consentimento explícito, forneça alternativa manual e jamais use biometria como único mecanismo de punição/decisão contestável.
 - Embeddings são dados biométricos sensíveis: use HTTPS, controle de acesso, criptografia em repouso/chaves fora do código, auditoria e retenção mínima. Este MVP persiste embeddings em JSON apenas para demonstração; em produção, proteja-os em armazenamento apropriado e descarte eventos/imagens brutas.
 - Ajuste o limiar com dados autorizados e monitore falsos positivos/negativos antes de uso real.
+- Este cliente não implementa prova de vida/anti-spoofing. Não trate uma foto/tela como impossível; para produção, acrescente liveness detection e revisão humana para casos contestados.
