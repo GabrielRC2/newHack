@@ -252,3 +252,4 @@ def list_attendance(sessao_aula_id: int) -> List[PresencaResponse]:
         )
         for row in rows
     ]
+
