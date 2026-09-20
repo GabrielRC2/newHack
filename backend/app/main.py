@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from datetime import datetime, time
+from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from .database import Base, engine, get_db
@@ -11,8 +12,9 @@ from .models import Attendance, ClassSession, FaceEmbedding, PresenceInterval, R
 from .schemas import (
     AttendanceOut, ClassSessionCreate, ClassSessionOut, EmbeddingCreate, FinalizeOut,
     IntervalOut, RecognitionOut, RecognitionRequest, ScheduledSessionCreate, StudentCreate, StudentOut,
+    StudentSummaryOut,
 )
-from .services import COOLDOWN_SECONDS, find_student_by_embedding, get_or_create_attendance, last_state_change, total_present_seconds
+from .services import COOLDOWN_SECONDS, MATCH_THRESHOLD, find_student_by_embedding, get_or_create_attendance, last_state_change, total_present_seconds
 
 Base.metadata.create_all(bind=engine)
 
@@ -35,7 +37,31 @@ def get_session_or_404(db: Session, class_id: int) -> ClassSession:
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    # Mostra qual banco esta em uso: util quando ha mais de um .db no projeto.
+    database = engine.url.database
+    if database and engine.url.drivername.startswith("sqlite"):
+        database = Path(database).resolve().as_posix()
+    return {
+        "status": "ok",
+        "database": database or "memoria",
+        "match_threshold": MATCH_THRESHOLD,
+        "cooldown_seconds": COOLDOWN_SECONDS,
+    }
+
+
+@app.get("/students", response_model=list[StudentSummaryOut])
+def list_students(db: Session = Depends(get_db)):
+    rows = db.execute(
+        select(Student, func.count(FaceEmbedding.id))
+        .outerjoin(FaceEmbedding, FaceEmbedding.student_id == Student.id)
+        .group_by(Student.id)
+        .order_by(Student.name)
+    ).all()
+    return [
+        StudentSummaryOut(id=s.id, name=s.name, enrollment_number=s.enrollment_number,
+                          created_at=s.created_at, embeddings_count=count)
+        for s, count in rows
+    ]
 
 
 @app.post("/students", response_model=StudentOut, status_code=status.HTTP_201_CREATED)
@@ -70,6 +96,18 @@ def create_session(payload: ClassSessionCreate, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(session)
     return session
+
+
+@app.get("/sessions", response_model=list[ClassSessionOut])
+def list_sessions(limit: int = 50, db: Session = Depends(get_db)):
+    return db.scalars(
+        select(ClassSession).order_by(ClassSession.starts_at.desc(), ClassSession.id.desc()).limit(limit)
+    ).all()
+
+
+@app.get("/sessions/{class_id}", response_model=ClassSessionOut)
+def get_session(class_id: int, db: Session = Depends(get_db)):
+    return get_session_or_404(db, class_id)
 
 
 @app.post("/sessions/scheduled", response_model=ClassSessionOut, status_code=status.HTTP_201_CREATED)

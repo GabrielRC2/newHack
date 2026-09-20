@@ -23,6 +23,15 @@ class StudentOut(BaseModel):
     tempo_em_aula: int
 
 
+class StudentSummaryOut(BaseModel):
+    """Aluno cadastrado, com quantas fotos (embeddings) ele tem."""
+    id: int
+    name: str
+    enrollment_number: str
+    created_at: datetime
+    embeddings_count: int
+
+
 class ClassSessionCreate(BaseModel):
     label: str = Field(min_length=1, max_length=160)
     starts_at: datetime
