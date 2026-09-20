@@ -11,9 +11,14 @@ from __future__ import annotations
 
 import html
 import os
+import subprocess
+import sys
 import threading
 import time as clock
+from csv import DictWriter
 from datetime import date, datetime, time, timedelta, timezone
+from io import StringIO
+from pathlib import Path
 
 import cv2 as cv
 import numpy as np
@@ -184,6 +189,265 @@ def session_label(item: dict) -> str:
     end = datetime.fromisoformat(item["ends_at"])
     state = "aberta" if item["status"] == "open" else "encerrada"
     return f"#{item['id']} {item['label']}, {start:%d/%m %H:%M} às {end:%H:%M} ({state})"
+
+
+# --------------------------------------------------------------------------- relatorio
+
+STATUS_LABELS = {"pending": "Em andamento", "present": "Presente", "absent": "Ausente"}
+
+
+def parse_dt(value: str | None) -> datetime | None:
+    return datetime.fromisoformat(value) if value else None
+
+
+def display_time(value: datetime | str | None) -> str:
+    moment = parse_dt(value) if isinstance(value, str) else value
+    return moment.strftime("%H:%M:%S") if moment else "—"
+
+
+def display_duration(seconds: int) -> str:
+    hours, remainder = divmod(max(0, int(seconds)), 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:02d}h {minutes:02d}min {secs:02d}s"
+
+
+def build_report(records: list[dict], session: dict) -> dict:
+    """Consolida a frequência de uma aula em resumo, tabela por aluno e lista de intervalos."""
+    starts_at, ends_at = parse_dt(session["starts_at"]), parse_dt(session["ends_at"])
+    closed = session["status"] == "closed"
+    # Ponto ate onde o tempo ja "existe": encerramento real, ou agora (limitado ao fim oficial).
+    reference = parse_dt(session["closed_at"]) if closed and session.get("closed_at") else min(datetime.now(), ends_at)
+    official_seconds = max(1, int((ends_at - starts_at).total_seconds()))
+    required_seconds = int(official_seconds * session["minimum_percentage"])
+
+    students: list[dict] = []
+    intervals: list[dict] = []
+    for item in sorted(records, key=lambda record: record["student_name"].lower()):
+        student_intervals = item["intervals"]
+        first_entry = parse_dt(student_intervals[0]["entered_at"]) if student_intervals else None
+        last = student_intervals[-1] if student_intervals else None
+        last_exit = parse_dt(last["exited_at"]) if last else None
+        inside_now = bool(last and last["exited_at"] is None)
+
+        total = int(item["total_seconds"])
+        late_seconds = max(0, int((first_entry - starts_at).total_seconds())) if first_entry else None
+        if first_entry:
+            span_end = min(last_exit or reference, ends_at)
+            span = max(0, int((span_end - max(first_entry, starts_at)).total_seconds()))
+            away_seconds = max(0, span - total)
+        else:
+            away_seconds = 0
+
+        students.append({
+            "name": item["student_name"], "enrollment": item["enrollment_number"],
+            "first_entry": first_entry, "last_exit": last_exit, "inside_now": inside_now,
+            "intervals": len(student_intervals), "total_seconds": total,
+            "percentage": total / official_seconds * 100,
+            "missing_seconds": max(0, required_seconds - total),
+            "late_seconds": late_seconds, "away_seconds": away_seconds,
+            "status": item["status"] if item["status"] != "pending" or first_entry else "no_record",
+        })
+        for number, interval in enumerate(student_intervals, start=1):
+            entry, exit_ = parse_dt(interval["entered_at"]), parse_dt(interval["exited_at"])
+            clipped_start = max(entry, starts_at)
+            clipped_end = min(exit_ or reference, ends_at)
+            intervals.append({
+                "name": item["student_name"], "enrollment": item["enrollment_number"], "number": number,
+                "entered_at": entry, "exited_at": exit_, "open": exit_ is None,
+                "seconds": max(0, int((clipped_end - clipped_start).total_seconds())),
+                "chart_start": clipped_start, "chart_end": max(clipped_start, clipped_end),
+            })
+
+    counted = [s for s in students if s["first_entry"]]
+    summary = {
+        "starts_at": starts_at, "ends_at": ends_at, "closed": closed,
+        "closed_at": parse_dt(session.get("closed_at")), "reference": reference,
+        "official_seconds": official_seconds, "required_seconds": required_seconds,
+        "minimum_percentage": session["minimum_percentage"],
+        "total_students": len(students), "attended": len(counted),
+        "present": sum(s["status"] == "present" for s in students),
+        "absent": sum(s["status"] == "absent" for s in students),
+        "inside": sum(s["inside_now"] for s in students),
+        "average_seconds": int(sum(s["total_seconds"] for s in counted) / len(counted)) if counted else 0,
+        "late_students": sum(1 for s in counted if s["late_seconds"] and s["late_seconds"] >= 60),
+    }
+    return {"summary": summary, "students": students, "intervals": intervals}
+
+
+def student_status_label(student: dict) -> str:
+    if student["status"] == "no_record":
+        return "Sem registro"
+    return STATUS_LABELS.get(student["status"], student["status"])
+
+
+def report_display_rows(report: dict) -> list[dict]:
+    return [{
+        "Aluno": s["name"], "Matrícula": s["enrollment"],
+        "Primeira entrada": display_time(s["first_entry"]),
+        "Atraso": "—" if s["late_seconds"] is None else f"{s['late_seconds'] // 60} min",
+        "Última saída": "Em sala" if s["inside_now"] else display_time(s["last_exit"]),
+        "Intervalos": s["intervals"],
+        "Tempo em sala": display_duration(s["total_seconds"]),
+        "Tempo ausente*": display_duration(s["away_seconds"]) if s["first_entry"] else "—",
+        "% da aula": f"{s['percentage']:.1f}%",
+        "Falta p/ mínimo": display_duration(s["missing_seconds"]) if s["status"] != "present" else "—",
+        "Situação": student_status_label(s),
+    } for s in report["students"]]
+
+
+def to_csv(rows: list[dict]) -> bytes:
+    if not rows:
+        return b""
+    output = StringIO()
+    writer = DictWriter(output, fieldnames=list(rows[0]), lineterminator="\n")
+    writer.writeheader()
+    writer.writerows(rows)
+    return output.getvalue().encode("utf-8-sig")  # BOM para o Excel abrir acentos corretamente
+
+
+def report_csv_rows(report: dict) -> list[dict]:
+    return [{
+        "Aluno": s["name"], "Matrícula": s["enrollment"],
+        "Primeira entrada": display_time(s["first_entry"]),
+        "Atraso (min)": "" if s["late_seconds"] is None else round(s["late_seconds"] / 60, 1),
+        "Última saída": "Em sala" if s["inside_now"] else display_time(s["last_exit"]),
+        "Intervalos": s["intervals"],
+        "Tempo em sala (min)": round(s["total_seconds"] / 60, 2),
+        "Tempo ausente entre entradas (min)": round(s["away_seconds"] / 60, 2),
+        "% da aula": round(s["percentage"], 1),
+        "Falta para o mínimo (min)": round(s["missing_seconds"] / 60, 2),
+        "Situação": student_status_label(s),
+    } for s in report["students"]]
+
+
+def interval_rows(report: dict) -> list[dict]:
+    return [{
+        "Aluno": i["name"], "Matrícula": i["enrollment"], "Nº": i["number"],
+        "Entrada": i["entered_at"].strftime("%d/%m/%Y %H:%M:%S"),
+        "Saída": "Em sala" if i["open"] else i["exited_at"].strftime("%d/%m/%Y %H:%M:%S"),
+        "Duração contabilizada": display_duration(i["seconds"]),
+    } for i in report["intervals"]]
+
+
+def report_html(session: dict, class_id: int, report: dict) -> bytes:
+    """Relatório autocontido, pronto para abrir no navegador e imprimir/salvar em PDF."""
+    s = report["summary"]
+    esc = html.escape
+    status_text = "Aula encerrada" if s["closed"] else "Relatório parcial (aula em andamento)"
+    student_rows = "".join(
+        f"<tr><td>{esc(r['Aluno'])}</td><td>{esc(r['Matrícula'])}</td><td>{r['Primeira entrada']}</td>"
+        f"<td>{r['Última saída']}</td><td>{r['Intervalos']}</td><td>{r['Tempo em sala']}</td>"
+        f"<td>{r['% da aula']}</td><td class='{('ok' if r['Situação'] == 'Presente' else 'bad' if r['Situação'] in ('Ausente', 'Sem registro') else '')}'>"
+        f"{r['Situação']}</td></tr>"
+        for r in report_display_rows(report)
+    )
+    interval_html = "".join(
+        f"<tr><td>{esc(r['Aluno'])}</td><td>{r['Nº']}</td><td>{r['Entrada']}</td><td>{r['Saída']}</td>"
+        f"<td>{r['Duração contabilizada']}</td></tr>"
+        for r in interval_rows(report)
+    )
+    document = f"""<!doctype html><html lang="pt-BR"><head><meta charset="utf-8">
+<title>Relatório da aula #{class_id}</title>
+<style>
+body{{font-family:Segoe UI,Arial,sans-serif;margin:32px;color:#0f172a}}
+h1{{margin:0 0 4px}} h2{{margin-top:28px;border-bottom:2px solid #0891b2;padding-bottom:4px}}
+.meta{{color:#475569}} .cards{{display:flex;gap:12px;flex-wrap:wrap;margin:16px 0}}
+.card{{border:1px solid #cbd5e1;border-radius:10px;padding:10px 16px;min-width:130px}}
+.card b{{display:block;font-size:1.4rem}} table{{border-collapse:collapse;width:100%;font-size:.9rem}}
+th,td{{border:1px solid #cbd5e1;padding:6px 8px;text-align:left}} th{{background:#f1f5f9}}
+.ok{{color:#047857;font-weight:600}} .bad{{color:#b91c1c;font-weight:600}}
+@media print{{body{{margin:12px}}}}
+</style></head><body>
+<h1>Relatório de frequência — {esc(session['label'])}</h1>
+<p class="meta">Aula #{class_id} · {s['starts_at']:%d/%m/%Y %H:%M} até {s['ends_at']:%H:%M} ·
+{status_text} · gerado em {datetime.now():%d/%m/%Y %H:%M}</p>
+<div class="cards">
+<div class="card"><b>{s['attended']}</b>alunos identificados</div>
+<div class="card"><b>{s['present']}</b>presentes</div>
+<div class="card"><b>{s['absent']}</b>ausentes</div>
+<div class="card"><b>{display_duration(s['average_seconds'])}</b>tempo médio em sala</div>
+<div class="card"><b>{s['minimum_percentage'] * 100:.0f}%</b>presença mínima ({display_duration(s['required_seconds'])})</div>
+</div>
+<h2>Frequência por aluno</h2>
+<table><tr><th>Aluno</th><th>Matrícula</th><th>Primeira entrada</th><th>Última saída</th><th>Intervalos</th>
+<th>Tempo em sala</th><th>% da aula</th><th>Situação</th></tr>{student_rows}</table>
+<h2>Entradas e saídas</h2>
+<table><tr><th>Aluno</th><th>Nº</th><th>Entrada</th><th>Saída</th><th>Duração contabilizada</th></tr>{interval_html}</table>
+<p class="meta">O tempo é contado desde o início oficial da aula e limitado ao seu término.</p>
+</body></html>"""
+    return document.encode("utf-8")
+
+
+def render_gantt(report: dict) -> None:
+    """Linha do tempo de presença: uma barra por intervalo de cada aluno."""
+    import altair as alt  # vem junto com o Streamlit
+    summary = report["summary"]
+    frame = pd.DataFrame([{
+        "Aluno": i["name"], "Entrada": i["chart_start"], "Saída": i["chart_end"],
+        "Duração": display_duration(i["seconds"]),
+    } for i in report["intervals"] if i["seconds"] > 0])
+    if frame.empty:
+        return
+    scale = alt.Scale(domain=[summary["starts_at"], summary["ends_at"]])
+    chart = alt.Chart(frame).mark_bar(cornerRadius=3, clip=True).encode(
+        x=alt.X("Entrada:T", scale=scale, title="Horário da aula"),
+        x2="Saída:T",
+        y=alt.Y("Aluno:N", title=None),
+        tooltip=["Aluno", alt.Tooltip("Entrada:T", format="%H:%M:%S"),
+                 alt.Tooltip("Saída:T", format="%H:%M:%S"), "Duração"],
+    ).properties(height=max(120, 34 * frame["Aluno"].nunique()))
+    st.altair_chart(chart, use_container_width=True)
+
+
+# --------------------------------------------------------------------------- janela de cadastro (OpenCV)
+
+ENROLL_KEY = "enrollment_camera"
+PROJECT_DIR = Path(__file__).resolve().parent
+
+
+@st.cache_resource
+def process_registry() -> dict[str, subprocess.Popen]:
+    """Compartilhado entre sessoes: sobrevive ao F5, entao ainda da para fechar a janela da webcam."""
+    return {}
+
+
+def enroll_process() -> subprocess.Popen | None:
+    return process_registry().get(ENROLL_KEY)
+
+
+def is_enroll_running() -> bool:
+    process = enroll_process()
+    return process is not None and process.poll() is None
+
+
+def start_enroll_process(name: str, enrollment: str, samples: int) -> tuple[bool, str]:
+    """Abre vision_client.enroll numa janela OpenCV, com a mesma virtualenv do Streamlit."""
+    if is_enroll_running():
+        return False, "A janela de cadastro já está aberta."
+    environment = os.environ.copy()
+    environment["FREQUENCY_API_URL"] = st.session_state.api_url
+    if st.session_state.api_token:
+        environment["FREQUENCY_API_TOKEN"] = st.session_state.api_token
+    command = [sys.executable, "-m", "vision_client.enroll", "--name", name,
+               "--enrollment-number", enrollment, "--samples", str(samples)]
+    try:
+        process_registry()[ENROLL_KEY] = subprocess.Popen(command, cwd=PROJECT_DIR, env=environment)
+    except OSError as exc:
+        return False, f"Não foi possível abrir a câmera: {exc}"
+    return True, "A janela da câmera foi aberta. Pressione C para capturar cada amostra."
+
+
+def stop_enroll_process() -> tuple[bool, str]:
+    process = enroll_process()
+    if process is None or process.poll() is not None:
+        return False, "Nenhuma janela de cadastro em execução."
+    process.terminate()
+    try:
+        process.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=3)
+    return True, "Janela de cadastro fechada."
 
 
 # --------------------------------------------------------------------------- visao
@@ -661,7 +925,8 @@ def tab_recognize(class_id: int | None, sessions: list[dict] | None) -> None:
 
 # --------------------------------------------------------------------------- aba: cadastro
 
-def tab_enroll() -> None:
+def enroll_with_photos() -> None:
+    """Cadastro pelo navegador: uma foto por vez com st.camera_input."""
     if engine_or_stop() is None:
         st.caption("Rode `python -m vision_client.download_models` para baixar os modelos.")
         return
@@ -718,7 +983,41 @@ def tab_enroll() -> None:
     if not ready and len(samples) >= target:
         st.caption("Preencha o nome (mínimo 2 letras) e a matrícula para concluir.")
 
-    st.subheader("Alunos cadastrados")
+
+def enroll_with_window() -> None:
+    """Cadastro pela janela da webcam (OpenCV), aberta no computador que roda o painel."""
+    st.info("Abre a janela da webcam. Deixe só um rosto no enquadramento e pressione **C** para capturar "
+            "cada amostra (**Q** cancela). Ao concluir, o aluno é enviado para a API.")
+    with st.form("enroll_window"):
+        name = st.text_input("Nome completo")
+        enrollment = st.text_input("Matrícula")
+        samples = st.slider("Quantidade de amostras", 1, 7, 3,
+                            help="Mais amostras, com ângulos e luz diferentes, melhoram o reconhecimento.")
+        go = st.form_submit_button("Abrir câmera para cadastrar", type="primary")
+    if go:
+        if len(name.strip()) < 2 or not enrollment.strip():
+            st.error("Preencha o nome (mínimo 2 letras) e a matrícula antes de abrir a câmera.")
+        else:
+            started, message = start_enroll_process(name.strip(), enrollment.strip(), samples)
+            (st.success if started else st.warning)(message)
+
+    process = enroll_process()
+    if is_enroll_running():
+        st.success("Janela de cadastro em execução. Quando terminar, clique em “Atualizar lista” abaixo.")
+        if st.button("Cancelar cadastro e fechar a câmera"):
+            stopped, message = stop_enroll_process()
+            (st.success if stopped else st.info)(message)
+    elif process is not None and process.poll() not in (None, 0):
+        st.warning(f"A janela de cadastro fechou com erro (código {process.poll()}). "
+                   "Veja o terminal do Streamlit e confirme que a webcam não está em uso.")
+    st.caption("A webcam só pode ser usada por um programa por vez: se a câmera contínua da aba Reconhecer "
+               "estiver ligada, clique em STOP nela antes de abrir esta janela.")
+
+
+def student_list_section() -> None:
+    head, refresh = st.columns([4, 1])
+    head.subheader("Alunos cadastrados")
+    refresh.button("Atualizar lista", use_container_width=True)  # o clique ja reexecuta a pagina
     students = fetch_students()
     if students is None:
         st.warning("Este backend ainda não lista alunos. Atualize `app/main.py` e `app/schemas.py` com os arquivos novos.")
@@ -726,23 +1025,35 @@ def tab_enroll() -> None:
         st.info("Nenhum aluno cadastrado ainda.")
     else:
         st.dataframe(pd.DataFrame([{
-            "Nome": item["name"], "Matrícula": item["enrollment_number"],
+            "ID": item["id"], "Nome": item["name"], "Matrícula": item["enrollment_number"],
             "Fotos": item["embeddings_count"], "Cadastrado em": fmt_utc_local(item["created_at"]),
         } for item in students]), hide_index=True)
 
         with st.expander("Remover aluno"):
-            labels = {item["id"]: f"{item['name']} ({item['enrollment_number']})" for item in students}
+            labels = {item["id"]: f"#{item['id']} {item['name']} ({item['enrollment_number']})" for item in students}
             picked = st.selectbox("Aluno", list(labels), format_func=labels.get, key="delete_student")
             st.caption("Apaga o cadastro, as fotos (embeddings) e todo o histórico de presença e reconhecimentos "
-                       "desse aluno, inclusive em aulas já encerradas. Isso não pode ser desfeito.")
+                       "desse aluno, inclusive em aulas já encerradas. Isso não pode ser desfeito. "
+                       "Quem ainda está dentro da sala não pode ser removido: registre a saída ou encerre a aula antes.")
             confirm_delete = st.checkbox("Entendo e quero apagar este aluno", key=f"delete_confirm_{picked}")
             if st.button("Apagar aluno", type="primary", disabled=not confirm_delete):
-                data, error = request("DELETE", f"/students/{picked}")
+                data, error = request("DELETE", f"/students/{picked}", params={"confirm": "true"})
                 if error:
                     st.error(error)
                 else:
                     flash(f"{data['name']} foi removido.")
                     st.rerun()
+
+
+def tab_enroll() -> None:
+    mode = st.radio("Como capturar o rosto", ["Janela da câmera (OpenCV)", "Fotos pelo navegador"],
+                    horizontal=True, key="enroll_mode")
+    if mode.startswith("Janela"):
+        enroll_with_window()
+    else:
+        enroll_with_photos()
+    st.divider()
+    student_list_section()
 
 
 # --------------------------------------------------------------------------- aba: aulas
@@ -751,25 +1062,41 @@ def tab_sessions(class_id: int | None, sessions: list[dict] | None) -> None:
     left, right = st.columns(2, gap="large")
 
     with left:
-        st.subheader("Nova aula no horário oficial")
-        with st.form("scheduled"):
-            class_date = st.date_input("Data", value=date.today())
-            slot = st.selectbox("Horário", range(1, 7), format_func=lambda i: SCHEDULE[i - 1])
+        st.subheader("Nova aula")
+        mode = st.radio("Horário", ["Livre (escolho início e fim)", "Oficial da escola"], horizontal=True, key="slot_mode")
+        free = mode.startswith("Livre")
+        with st.form("new_session"):
+            day = st.date_input("Data", value=date.today())
+            if free:
+                t1, t2 = st.columns(2)
+                start = t1.time_input("Início", value=time(8, 0), step=60)
+                end = t2.time_input("Fim", value=time(9, 0), step=60)
+            else:
+                slot = st.selectbox("Horário", range(1, 7), format_func=lambda i: SCHEDULE[i - 1])
             label = st.text_input("Turma", "Turma A")
             pct = st.slider("Presença mínima (%)", 10, 100, 75)
             create = st.form_submit_button("Criar aula", type="primary")
         if create:
-            data, error = request("POST", "/sessions/scheduled", json={
-                "class_date": class_date.isoformat(), "schedule_index": slot,
-                "label": label or None, "minimum_percentage": pct / 100,
-            })
+            if not label.strip():
+                data, error = None, "Informe o nome ou a descrição da turma."
+            elif free and datetime.combine(day, end) <= datetime.combine(day, start):
+                data, error = None, "O fim precisa ser depois do início."
+            elif free:
+                data, error = request("POST", "/sessions", json={
+                    "label": label.strip(), "starts_at": datetime.combine(day, start).isoformat(),
+                    "ends_at": datetime.combine(day, end).isoformat(), "minimum_percentage": pct / 100,
+                })
+            else:
+                data, error = request("POST", "/sessions/scheduled", json={
+                    "class_date": day.isoformat(), "schedule_index": slot,
+                    "label": label.strip(), "minimum_percentage": pct / 100,
+                })
             if error:
                 st.error(error)
             else:
                 st.session_state.active_class = data["id"]
                 flash(f"Aula criada com ID {data['id']}. Ela já está selecionada.")
                 st.rerun()
-
 
         if st.button("Criar aula de teste (agora até daqui a 1 hora)"):
             now = datetime.now().replace(microsecond=0)
@@ -783,27 +1110,6 @@ def tab_sessions(class_id: int | None, sessions: list[dict] | None) -> None:
                 st.session_state.active_class = data["id"]
                 flash(f"Aula de teste criada com ID {data['id']} (meta de 10% para facilitar o teste).")
                 st.rerun()
-
-        with st.expander("Aula com horário personalizado"):
-            with st.form("custom"):
-                day = st.date_input("Data", value=date.today(), key="custom_day")
-                t1, t2 = st.columns(2)
-                start = t1.time_input("Início", value=time(8, 0))
-                end = t2.time_input("Fim", value=time(9, 0))
-                custom_label = st.text_input("Turma", "Turma A", key="custom_label")
-                custom_pct = st.slider("Presença mínima (%)", 10, 100, 75, key="custom_pct")
-                custom_create = st.form_submit_button("Criar aula personalizada")
-            if custom_create:
-                data, error = request("POST", "/sessions", json={
-                    "label": custom_label, "starts_at": datetime.combine(day, start).isoformat(),
-                    "ends_at": datetime.combine(day, end).isoformat(), "minimum_percentage": custom_pct / 100,
-                })
-                if error:
-                    st.error(error)
-                else:
-                    st.session_state.active_class = data["id"]
-                    flash(f"Aula criada com ID {data['id']}. Ela já está selecionada.")
-                    st.rerun()
 
     with right:
         st.subheader("Encerrar aula")
@@ -833,6 +1139,68 @@ def tab_sessions(class_id: int | None, sessions: list[dict] | None) -> None:
                 "Meta": f"{s['minimum_percentage']:.0%}",
                 "Situação": "Aberta" if s["status"] == "open" else "Encerrada",
             } for s in sessions]), hide_index=True)
+
+
+# --------------------------------------------------------------------------- aba: relatorio
+
+def tab_report(class_id: int | None) -> None:
+    top, reload_col = st.columns([4, 1])
+    top.subheader("Relatório da aula")
+    reload_col.button("Recarregar", use_container_width=True, key="reload_report")
+    if class_id is None:
+        st.info("Crie ou selecione uma aula na barra lateral para ver o relatório.")
+        return
+
+    session, error = request("GET", f"/sessions/{class_id}")
+    if error:
+        st.error(error)
+        return
+    records, error = request("GET", f"/sessions/{class_id}/attendance")
+    if error:
+        st.error(error)
+        return
+
+    report = build_report(records or [], session)
+    s = report["summary"]
+    st.markdown(f"**{session['label']}** · aula #{class_id} · "
+                f"{s['starts_at']:%d/%m/%Y}, {s['starts_at']:%H:%M} às {s['ends_at']:%H:%M}")
+    if s["closed"]:
+        st.success(f"Relatório final · aula encerrada às {s['closed_at']:%H:%M:%S}." if s["closed_at"] else "Relatório final.")
+    else:
+        st.info("Relatório parcial: a aula ainda está em andamento e os números mudam a cada passagem pela câmera.")
+
+    c = st.columns(5)
+    c[0].metric("Alunos com registro", s["total_students"])
+    c[1].metric("Identificados", s["attended"])
+    c[2].metric("Presentes", s["present"] if s["closed"] else "—")
+    c[3].metric("Ausentes", s["absent"] if s["closed"] else "—")
+    c[4].metric("Tempo médio em sala", display_duration(s["average_seconds"]))
+    st.caption(f"Duração oficial: {display_duration(s['official_seconds'])} · mínimo de {s['minimum_percentage'] * 100:.0f}% "
+               f"= {display_duration(s['required_seconds'])} · {s['late_students']} aluno(s) chegaram com mais de 1 min de atraso.")
+
+    if not report["students"]:
+        st.info("Ainda não há alunos com registro nesta aula.")
+        return
+
+    st.markdown("#### Frequência por aluno")
+    st.dataframe(report_display_rows(report), hide_index=True)
+    st.caption("*Tempo ausente = tempo fora da sala entre a primeira entrada e a última saída. "
+               "O tempo em sala é contado desde o início oficial e limitado ao término da aula.")
+
+    st.markdown("#### Linha do tempo de presença")
+    render_gantt(report)
+
+    st.markdown("#### Todas as entradas e saídas")
+    st.dataframe(interval_rows(report), hide_index=True)
+
+    st.markdown("#### Exportar")
+    d1, d2, d3 = st.columns(3)
+    d1.download_button("Resumo por aluno (CSV)", data=to_csv(report_csv_rows(report)),
+                       file_name=f"frequencia_aula_{class_id}.csv", mime="text/csv", use_container_width=True)
+    d2.download_button("Entradas e saídas (CSV)", data=to_csv(interval_rows(report)),
+                       file_name=f"entradas_saidas_aula_{class_id}.csv", mime="text/csv", use_container_width=True)
+    d3.download_button("Relatório imprimível (HTML)", data=report_html(session, class_id, report),
+                       file_name=f"relatorio_aula_{class_id}.html", mime="text/html", use_container_width=True)
 
 
 # --------------------------------------------------------------------------- aba: diagnostico
@@ -891,7 +1259,8 @@ def main() -> None:
         st.success(st.session_state.flash)
         st.session_state.flash = None
 
-    painel, reconhecer, cadastro, aulas, diagnostico = st.tabs(["Painel", "Reconhecer", "Cadastrar aluno", "Aulas", "Diagnóstico"])
+    painel, reconhecer, cadastro, aulas, relatorio, diagnostico = st.tabs(
+        ["Painel", "Reconhecer", "Cadastrar aluno", "Aulas", "Relatório", "Diagnóstico"])
     with painel:
         tab_dashboard(class_id, sessions)
     with reconhecer:
@@ -900,6 +1269,8 @@ def main() -> None:
         tab_enroll()
     with aulas:
         tab_sessions(class_id, sessions)
+    with relatorio:
+        tab_report(class_id)
     with diagnostico:
         tab_diagnostics()
 

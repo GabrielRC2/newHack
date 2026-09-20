@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, time
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, Query, status
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
@@ -78,10 +78,25 @@ def create_student(payload: StudentCreate, db: Session = Depends(get_db)):
 
 
 @app.delete("/students/{student_id}")
-def delete_student(student_id: int, db: Session = Depends(get_db)):
+def delete_student(
+    student_id: int,
+    confirm: bool = Query(False, description="Envie true para confirmar a exclusao permanente"),
+    db: Session = Depends(get_db),
+):
+    if not confirm:
+        raise HTTPException(status_code=422, detail="Exclusao exige ?confirm=true")
     student = db.get(Student, student_id)
     if not student:
         raise HTTPException(status_code=404, detail="Aluno nao encontrado")
+    has_open_interval = db.scalar(select(PresenceInterval.id).where(
+        PresenceInterval.student_id == student_id,
+        PresenceInterval.exited_at.is_(None),
+    )) is not None
+    if has_open_interval:
+        raise HTTPException(
+            status_code=409,
+            detail="Aluno possui presenca aberta. Registre a saida ou finalize a aula antes de remover.",
+        )
     name = student.name
     # Attendance, PresenceInterval e RecognitionEvent nao tem cascade no modelo:
     # apagamos explicitamente para nao deixar registros orfaos (e para nao violar FKs em outros bancos).
