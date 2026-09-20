@@ -1,1 +1,1 @@
-"""Backend do MVP de presença por reconhecimento facial."""
+"""MVP de frequencia por reconhecimento facial."""

@@ -1,117 +1,78 @@
-import numpy as np
-import json
-from datetime import timezone, datetime  # <-- Adicionado o datetime aqui
+"""Regras puras e servicos de dominio para matching e frequencia."""
+from __future__ import annotations
+
+import math
+import os
+from datetime import datetime
+
+from sqlalchemy import select
 from sqlalchemy.orm import Session
-from data.models import Student, FaceEmbedding, ClassSession, Attendance, PresenceInterval
 
-COOLDOWN_SECONDS = 15
-SIMILARITY_THRESHOLD = 0.7
-
-# ... resto do código continua igual ...
+from .models import Attendance, FaceEmbedding, PresenceInterval, RecognitionEvent, Student
 
 
-def cosine_similarity(vec1, vec2):
-    v1, v2 = np.array(vec1), np.array(vec2)
-    return np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
+# O modelo SFace do OpenCV usa similaridade de cosseno; 0.45 e um ponto de partida
+# conservador. Este valor deve ser calibrado com dados autorizados da instituicao.
+MATCH_THRESHOLD = float(os.getenv("FACE_MATCH_THRESHOLD", "0.45"))
+COOLDOWN_SECONDS = int(os.getenv("RECOGNITION_COOLDOWN_SECONDS", "15"))
 
 
-def match_face(db: Session, target_embedding: list):
-    embeddings = db.query(FaceEmbedding).all()
-    best_match, highest_sim = None, 0.0
-
-    for emb in embeddings:
-        saved_vec = json.loads(emb.embedding_json)
-        sim = cosine_similarity(target_embedding, saved_vec)
-        if sim > highest_sim and sim >= SIMILARITY_THRESHOLD:
-            highest_sim = sim
-            best_match = emb.student_id
-
-    return best_match
+def cosine_similarity(left: list[float], right: list[float]) -> float:
+    if len(left) != len(right):
+        return -1.0
+    dot = sum(a * b for a, b in zip(left, right))
+    norm_left = math.sqrt(sum(a * a for a in left))
+    norm_right = math.sqrt(sum(b * b for b in right))
+    if norm_left == 0 or norm_right == 0:
+        return -1.0
+    return dot / (norm_left * norm_right)
 
 
-def process_recognition(db: Session, class_id: int, embedding: list, timestamp: datetime):
-    student_id = match_face(db, embedding)
-    if not student_id:
-        return {"status": "unregistered", "message": "Rosto não reconhecido."}
-
-    session_info = db.query(ClassSession).filter(ClassSession.id == class_id).first()
-    if not session_info or session_info.is_closed:
-        return {"status": "error", "message": "Aula não encontrada ou já encerrada."}
-
-    # Busca ou cria o registro de frequência (Attendance)
-    attendance = db.query(Attendance).filter_by(student_id=student_id, class_session_id=class_id).first()
-
-    if not attendance:
-        attendance = Attendance(
-            student_id=student_id,
-            class_session_id=class_id,
-            em_aula=False,
-            tempo_em_aula=0
-        )
-        db.add(attendance)
-        db.commit()
-        db.refresh(attendance)
-
-    # Cooldown (Debounce)
-    if attendance.last_event_at:
-        diff = (timestamp - attendance.last_event_at.replace(tzinfo=timezone.utc)).total_seconds()
-        if diff < COOLDOWN_SECONDS:
-            return {"status": "cooldown", "message": "Reconhecimento ignorado (cooldown)."}
-
-    attendance.last_event_at = timestamp
-
-    if not attendance.em_aula:
-        # ALUNO ENTRANDO
-        attendance.em_aula = True
-        interval = PresenceInterval(attendance_id=attendance.id, entered_at=timestamp)
-        db.add(interval)
-        msg = "Entrada registrada."
-    else:
-        # ALUNO SAINDO
-        attendance.em_aula = False
-        interval = db.query(PresenceInterval).filter_by(
-            attendance_id=attendance.id, exited_at=None
-        ).order_by(PresenceInterval.entered_at.desc()).first()
-
-        if interval:
-            interval.exited_at = timestamp
-
-            # Calcula o tempo efetivo apenas dentro do horário oficial da aula
-            calc_start = max(interval.entered_at, session_info.starts_at)
-            calc_end = min(interval.exited_at, session_info.ends_at)
-
-            if calc_end > calc_start:
-                minutes_added = (calc_end - calc_start).total_seconds() / 60.0
-                attendance.tempo_em_aula += int(minutes_added)
-        msg = "Saída registrada."
-
-    db.commit()
-    return {"status": "success", "message": msg, "em_aula": attendance.em_aula,
-            "tempo_em_aula": attendance.tempo_em_aula}
+def find_student_by_embedding(db: Session, vector: list[float], threshold: float = MATCH_THRESHOLD):
+    best_student: Student | None = None
+    best_score = -1.0
+    for item in db.scalars(select(FaceEmbedding)).all():
+        score = cosine_similarity(vector, item.vector)
+        if score > best_score:
+            best_score = score
+            best_student = item.student
+    if best_student is None or best_score < threshold:
+        return None, best_score if best_score >= 0 else None
+    return best_student, best_score
 
 
-def fechar_aula(db: Session, class_id: int):
-    session_info = db.query(ClassSession).filter(ClassSession.id == class_id).first()
-    if not session_info: return False
+def get_or_create_attendance(db: Session, class_id: int, student_id: int) -> Attendance:
+    record = db.scalar(select(Attendance).where(
+        Attendance.class_session_id == class_id,
+        Attendance.student_id == student_id,
+    ))
+    if record is None:
+        record = Attendance(class_session_id=class_id, student_id=student_id)
+        db.add(record)
+        db.flush()
+    return record
 
-    attendances = db.query(Attendance).filter_by(class_session_id=class_id).all()
-    duracao_total = (session_info.ends_at - session_info.starts_at).total_seconds() / 60.0
-    minutos_exigidos = duracao_total * session_info.min_presence_percent
 
-    for att in attendances:
-        # Se esqueceu de sair (ainda em_aula = True), fecha no horário atual ou fim da aula
-        if att.em_aula:
-            interval = db.query(PresenceInterval).filter_by(attendance_id=att.id, exited_at=None).first()
-            if interval:
-                interval.exited_at = session_info.ends_at
-                calc_start = max(interval.entered_at, session_info.starts_at)
-                if session_info.ends_at > calc_start:
-                    att.tempo_em_aula += int((session_info.ends_at - calc_start).total_seconds() / 60.0)
-            att.em_aula = False
+def clipped_seconds(interval: PresenceInterval, starts_at: datetime, ends_at: datetime, open_until: datetime | None = None) -> int:
+    interval_end = interval.exited_at or open_until
+    if interval_end is None:
+        return 0
+    start = max(interval.entered_at, starts_at)
+    end = min(interval_end, ends_at)
+    return max(0, int((end - start).total_seconds()))
 
-        # Define status final
-        att.status_final = "present" if att.tempo_em_aula >= minutos_exigidos else "absent"
 
-    session_info.is_closed = True
-    db.commit()
-    return True
+def total_present_seconds(db: Session, class_id: int, student_id: int, starts_at: datetime, ends_at: datetime, open_until: datetime | None = None) -> int:
+    intervals = db.scalars(select(PresenceInterval).where(
+        PresenceInterval.class_session_id == class_id,
+        PresenceInterval.student_id == student_id,
+    )).all()
+    return sum(clipped_seconds(interval, starts_at, ends_at, open_until) for interval in intervals)
+
+
+def last_state_change(db: Session, class_id: int, student_id: int) -> RecognitionEvent | None:
+    return db.scalar(select(RecognitionEvent).where(
+        RecognitionEvent.class_session_id == class_id,
+        RecognitionEvent.student_id == student_id,
+        RecognitionEvent.status == "identified",
+    ).order_by(RecognitionEvent.detected_at.desc()))

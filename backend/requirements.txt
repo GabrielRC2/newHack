@@ -1,3 +1,11 @@
-fastapi>=0.115,<1.0
-uvicorn[standard]>=0.30,<1.0
-httpx>=0.27,<1.0
+fastapi>=0.110
+uvicorn[standard]>=0.27
+sqlalchemy>=2.0
+pydantic>=2.0
+streamlit>=1.32
+requests>=2.31
+pytest>=8.0
+httpx>=0.27
+numpy>=1.26
+# Inclui FaceDetectorYN e FaceRecognizerSF; possui wheel para Python 3.14.
+opencv-python>=4.13
