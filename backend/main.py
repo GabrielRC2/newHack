@@ -1,10 +1,10 @@
 
+"""Ponto de entrada local para a API do MVP."""
+
+from app.main import app
 
 
-# Press the green button in the gutter to run the script.
-if __name__ == '__main__':
-    print("Hello World")
-    print("Hello World")
-    print("Hello World")
+if __name__ == "__main__":
+    import uvicorn
 
-# See PyCharm help at https://www.jetbrains.com/help/pycharm/
+    uvicorn.run("app.main:app", host="127.0.0.1", port=8000, reload=True)
